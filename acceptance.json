@@ -1,0 +1,11 @@
+{
+  "files_exist": ["doneguard.py", "README.md", "LICENSE"],
+  "commands": [
+    {
+      "run": "python -m unittest discover -s tests",
+      "timeout": 300,
+      "expect_exit": 0,
+      "forbid_output": ["FAILED", "Traceback", "ERROR:"]
+    }
+  ]
+}
