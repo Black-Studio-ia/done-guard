@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 — 2026-10-15
+
+- New check kind `added_forbid`: user regexes that must not appear in
+  added lines vs HEAD (catches narrowed tests — `.only`, `@pytest.mark.skip`,
+  `# noqa` — added to dodge failures). Reported, never echoing lines.
+- README comparison now names `donegate`, `agentlint`, and `agent-audits`
+  honestly, including where they are stronger.
+
 ## 0.2.0 — 2026-10-15
 
 - New check kind `files_nonempty` (+ `--expect-nonempty`): required

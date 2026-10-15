@@ -24,14 +24,14 @@ import signal
 import subprocess
 import sys
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 DEFAULT_TIMEOUT = 300
 OUTPUT_TAIL_LINES = 20
 OUTPUT_LINE_LIMIT = 500
 
 TOP_LEVEL_KEYS = {"files_exist", "files_nonempty", "files_changed",
-                  "commands"}
+                  "added_forbid", "commands"}
 COMMAND_KEYS = {"run", "timeout", "expect_exit", "expect_output",
                 "forbid_output", "cwd"}
 
@@ -180,6 +180,84 @@ def _is_nonempty(root: str, rel: str) -> bool:
         return False
 
 
+def _added_lines(root: str) -> tuple[list[tuple[str, int]], bool]:
+    """Added lines vs HEAD as ``[(path, line)]``. Untracked files count
+    fully. Returns ``([], False)`` when there is no git baseline."""
+    code, _ = _git(root, ["rev-parse", "--is-inside-work-tree"])
+    if code != 0:
+        return [], False
+    code, _ = _git(root, ["rev-parse", "--verify", "HEAD"])
+    if code != 0:
+        return [], False
+    out_lines: list[tuple[str, int]] = []
+    code, out = _git(root, ["diff", "-U0", "HEAD", "--", "."])
+    if code == 0:
+        path: str | None = None
+        for raw in out.splitlines():
+            if raw.startswith("diff --git "):
+                path = None
+                continue
+            if raw.startswith("+++ "):
+                target = raw[4:].strip()
+                if target == "/dev/null":
+                    path = None
+                    continue
+                if target.startswith('"') and target.endswith('"'):
+                    target = target[1:-1]
+                path = (target[2:] if target.startswith("b/") else target)
+            elif raw.startswith("@@ ") or raw.startswith("--- "):
+                continue
+            elif path is not None and raw.startswith("+") \
+                    and not raw.startswith("+++"):
+                out_lines.append((path, raw[1:]))
+    code, untracked = _git(root, ["ls-files", "--others",
+                                  "--exclude-standard"])
+    if code == 0:
+        for rel in untracked.splitlines():
+            if not rel:
+                continue
+            try:
+                with open(os.path.join(root, rel), "r", encoding="utf-8",
+                          errors="replace") as handle:
+                    for line in handle:
+                        out_lines.append((rel, line.rstrip("\n")))
+            except OSError:
+                continue
+    return out_lines, True
+
+
+def check_added_forbid(root: str, patterns: list[str]) -> list[dict]:
+    """Fail when user-forbidden patterns appear in added lines.
+
+    Catches the classic gate-gaming move: narrowing tests to pass
+    (``describe.only``, ``@pytest.mark.skip``, ``# noqa`` …) instead of
+    fixing the code. Without a git baseline this check is explicitly
+    skipped (reported, not silently passed).
+    """
+    added, has_baseline = _added_lines(root)
+    if not has_baseline:
+        return [{"check": "added_forbid", "ok": True, "target": "(repo)",
+                 "evidence": "skipped: needs a git baseline with at "
+                 "least one commit to know which lines are added"}]
+    compiled = [(p, re.compile(p)) for p in patterns]
+    hits: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for path, line in added:
+        if "commit-guard-ignore" in line or "done-guard-ignore" in line:
+            continue
+        for pattern, regex in compiled:
+            if regex.search(line) and (path, pattern) not in seen:
+                seen.add((path, pattern))
+                hits.append({"check": "added_forbid", "ok": False,
+                             "target": pattern,
+                             "evidence": f"forbidden pattern added in "
+                             f"{path} (line content withheld)"})
+    if not hits:
+        hits.append({"check": "added_forbid", "ok": True, "target": "(repo)",
+                     "evidence": f"no forbidden patterns in added lines"})
+    return hits
+
+
 def check_files_changed(root: str, patterns: list[str]) -> list[dict]:
     findings: list[dict] = []
     changed, is_git = changed_set(root)
@@ -297,6 +375,17 @@ def load_criteria(path: str) -> tuple[dict | None, str]:
         problem = _check_string_list(data, key)
         if problem:
             return None, problem
+    added_forbid = data.get("added_forbid", [])
+    if not isinstance(added_forbid, list) or not all(
+            isinstance(p, str) and p.strip() for p in added_forbid):
+        return None, "'added_forbid' must be a list of non-empty regex " \
+                     "strings"
+    for pattern in added_forbid:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            return None, f"added_forbid has an invalid regex " \
+                         f"{pattern!r}: {exc}"
     commands = data.get("commands", [])
     if not isinstance(commands, list):
         return None, "'commands' must be a list"
@@ -334,7 +423,8 @@ def load_criteria(path: str) -> tuple[dict | None, str]:
         if "cwd" in spec and not isinstance(spec["cwd"], str):
             return None, f"commands[{i}].cwd must be a string"
     if not data.get("files_exist") and not data.get("files_nonempty") \
-            and not data.get("files_changed") and not commands:
+            and not data.get("files_changed") \
+            and not data.get("added_forbid") and not commands:
         return None, "no checks declared (nothing to verify)"
     return data, ""
 
@@ -347,6 +437,9 @@ def run_all(root: str, criteria: dict, show_output: bool) -> list[dict]:
         findings.extend(check_files_nonempty(root, [pattern]))
     for pattern in criteria.get("files_changed", []) or []:
         findings.extend(check_files_changed(root, [pattern]))
+    added_forbid = criteria.get("added_forbid", []) or []
+    if added_forbid:
+        findings.extend(check_added_forbid(root, added_forbid))
     for spec in criteria.get("commands", []) or []:
         findings.append(check_command(root, spec, show_output))
     return findings
@@ -386,6 +479,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expect-change", action="append", default=[],
                         help="require a file/glob changed vs HEAD "
                              "(repeatable)")
+    parser.add_argument("--forbid-added", action="append", default=[],
+                        help="regex that must not appear in added lines, "
+                             "e.g. focused-test markers (repeatable)")
     parser.add_argument("--run", action="append", default=[],
                         help="command that must exit 0 (repeatable)")
     parser.add_argument("--expect-output", action="append", default=[],
@@ -416,7 +512,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     criteria: dict = {"files_exist": [], "files_nonempty": [],
-                   "files_changed": [], "commands": []}
+                   "files_changed": [], "added_forbid": [], "commands": []}
     crit_path = (os.path.abspath(args.criteria) if args.criteria
                  else os.path.join(root, "acceptance.json"))
     if args.criteria or os.path.isfile(crit_path):
@@ -429,6 +525,14 @@ def main(argv: list[str] | None = None) -> int:
         criteria.setdefault("files_exist", []).append(pattern)
     for pattern in args.expect_nonempty:
         criteria.setdefault("files_nonempty", []).append(pattern)
+    for pattern in args.forbid_added:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            print(f"done-guard: error: invalid --forbid-added regex "
+                  f"{pattern!r}: {exc}", file=sys.stderr)
+            return 2
+        criteria.setdefault("added_forbid", []).append(pattern)
     for pattern in args.expect_change:
         criteria.setdefault("files_changed", []).append(pattern)
     if args.run and (args.expect_output or args.forbid_output):
@@ -444,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
             "forbid_output": args.forbid_output})
     if not criteria.get("files_exist") and not criteria.get("files_nonempty") \
             and not criteria.get("files_changed") \
+            and not criteria.get("added_forbid") \
             and not criteria.get("commands"):
         print("done-guard: error: no checks declared (pass flags or a "
               "criteria file)", file=sys.stderr)

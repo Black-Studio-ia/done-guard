@@ -138,6 +138,50 @@ class FilesTests(unittest.TestCase):
         self.assertEqual([f["ok"] for f in findings], [True, False, False])
         self.assertIn("placeholder", findings[1]["evidence"])
 
+    def test_added_forbid_catches_narrowed_tests(self):
+        root = make_repo({"t.test.js": "it('a', () => {});\n"})
+        self.addCleanup(shutil.rmtree, root, True)
+        git(root, "add", "-A")
+        git(root, "commit", "-m", "base")
+        path = os.path.join(root, "t.test.js")
+        with open(path, "a", encoding="utf-8", newline="\n") as handle:
+            handle.write("it.only('b', () => {});\n")
+        findings = doneguard.check_added_forbid(
+            root, [r"\.only\(", "@pytest.mark.skip"])
+        self.assertEqual(len(findings), 1)
+        self.assertFalse(findings[0]["ok"])
+        self.assertIn("t.test.js", findings[0]["evidence"])
+        # The matched line content itself must never appear.
+        self.assertNotIn("it.only", findings[0]["evidence"])
+
+    def test_added_forbid_clean_tree_passes(self):
+        root = make_repo({"t.test.js": "it('a', () => {});\n"})
+        self.addCleanup(shutil.rmtree, root, True)
+        git(root, "add", "-A")
+        git(root, "commit", "-m", "base")
+        findings = doneguard.check_added_forbid(root, [r"\.only\("])
+        self.assertTrue(all(f["ok"] for f in findings))
+
+    def test_added_forbid_without_git_skips_honestly(self):
+        plain = tempfile.mkdtemp(prefix="done-guard-nogit-")
+        self.addCleanup(shutil.rmtree, plain, True)
+        write(plain, "a.js", "it.only('x', () => {});\n")
+        findings = doneguard.check_added_forbid(plain, [r"\.only\("])
+        self.assertTrue(findings[0]["ok"])
+        self.assertIn("skipped", findings[0]["evidence"])
+
+    def test_added_forbid_bad_regex_rejected_at_load(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as tmp:
+            json.dump({"added_forbid": ["(unclosed"]}, tmp)
+            path = tmp.name
+        try:
+            data, err = doneguard.load_criteria(path)
+            self.assertIsNone(data)
+            self.assertIn("invalid regex", err)
+        finally:
+            os.unlink(path)
+
     def test_changed_detects_modification(self):
         write(self.root, "a.txt", "v1\n")
         write(self.root, "b.txt", "v1\n")

@@ -15,6 +15,7 @@ You declare the finish line **before** (or after) the agent runs — `acceptance
   "files_exist": ["dist/app.js", "CHANGELOG.md"],
   "files_nonempty": ["dist/app.js"],
   "files_changed": ["src/**/*.py"],
+  "added_forbid": ["\\.only\\(", "@pytest.mark.skip", "# noqa"],
   "commands": [
     {"run": "python -m pytest -q", "timeout": 300, "expect_exit": 0,
      "expect_output": ["passed"], "forbid_output": ["FAILED", "Traceback"]}
@@ -47,6 +48,8 @@ Exit codes: `0` evidenced, `1` unmet, `2` misconfigured. `--format json` for pip
 | promptfoo and prompt-eval tools | Evaluate model *outputs* with judges/models. done-guard executes *your repo's* commands and inspects *your* files. Complementary. |
 | Plain CI (tests must pass) | CI proves the suite is green, not that the assigned task's artifacts exist or that anything changed at all. done-guard binds checks to the task. |
 | Bespoke per-project scripts | Teams already hand-roll "don't say done without evidence" scripts — done-guard is that pattern as a reusable, tested tool. |
+| `donegate` (Node, zero-dep) | The closest alternative and genuinely more complete in places: agent Stop-hook integration that bounces the agent back mid-session, tamper guards (deleted/skipped tests, lint-disables, DONE.md edits), receipts, PR comments, `init` scaffolding. Choose donegate when you want hook-gated workflows and anti-gaming guards. Choose done-guard when you want a single Python file with no Node runtime, `files_changed`-vs-HEAD and non-empty-artifact semantics, strict fail-closed config validation, and JSON-first output. |
+| `agentlint`, `agent-audits` | Hook/CI-gated acceptance workflows in the same family; evaluate them alongside donegate if you need framework integration. |
 | The agent's own "done" message | The thing being verified. Never accept it unexamined. |
 
 ## What this proves — and what it does not
@@ -93,9 +96,10 @@ See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — test suite plus a
 
 ```
 usage: done-guard [--root DIR] [--criteria FILE] [--expect-file P]
-                  [--expect-nonempty P] [--expect-change P] [--run CMD]
-                  [--expect-output RE] [--forbid-output RE] [--timeout S]
-                  [--no-output] [--format text|json]
+                  [--expect-nonempty P] [--expect-change P]
+                  [--forbid-added RE] [--run CMD] [--expect-output RE]
+                  [--forbid-output RE] [--timeout S] [--no-output]
+                  [--format text|json]
 ```
 
 ## Security and privacy
