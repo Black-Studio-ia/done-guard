@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0 — 2026-10-15
+
+- New check kind `files_nonempty` (+ `--expect-nonempty`): required
+  artifacts must exist and be non-empty (catches placeholder files).
+- Fail-closed criteria validation: wrong types, empty strings, invalid
+  regexes, non-integer timeouts/exit codes are usage errors, never
+  silent passes or tracebacks.
+- Robust process handling: spawn failures become findings; POSIX timeouts
+  kill the whole process group so orphaned grandchildren cannot survive;
+  the direct child is always reaped (no zombies / ResourceWarning).
+- Fixed `__version__` lagging behind CHANGELOG (now 0.2.0).
+
 ## 0.1.1 — 2026-10-15
 
 Fixed critical defect found by CI: on POSIX systems a command timeout

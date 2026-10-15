@@ -20,31 +20,62 @@ import fnmatch
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 DEFAULT_TIMEOUT = 300
 OUTPUT_TAIL_LINES = 20
 OUTPUT_LINE_LIMIT = 500
 
-TOP_LEVEL_KEYS = {"files_exist", "files_changed", "commands"}
+TOP_LEVEL_KEYS = {"files_exist", "files_nonempty", "files_changed",
+                  "commands"}
 COMMAND_KEYS = {"run", "timeout", "expect_exit", "expect_output",
                 "forbid_output", "cwd"}
 
 
 def _run_shell(cmd: str, cwd: str,
                timeout: int) -> tuple[int, str, str, bool]:
-    """Run a shell string with a timeout. Never raises on timeout."""
+    """Run a shell string with a timeout. Never raises for timeouts or
+    spawn failures; callers always get a verdict tuple."""
+    new_session = {"start_new_session": True} if os.name != "nt" else {}
     try:
-        proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True,
-                              text=True, errors="replace", timeout=timeout)
-        return proc.returncode, proc.stdout or "", proc.stderr or "", False
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout if isinstance(exc.stdout, str) else ""
-        err = exc.stderr if isinstance(exc.stderr, str) else ""
-        return 124, out, err, True
+        proc = subprocess.Popen(
+            cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, errors="replace",
+            **new_session)  # type: ignore[arg-type]
+    except OSError as exc:
+        return 127, "", f"could not start command: {exc}", False
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out or "", err or "", False
+    except subprocess.TimeoutExpired:
+        # Kill the whole process group on POSIX so grandchildren (a runaway
+        # `sleep`, a hung child server, …) die with the shell, not after it.
+        if os.name != "nt":
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            out, err = proc.communicate(timeout=5)
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            # A surviving grandchild may hold the pipes open, so the
+            # re-drain can time out. The direct child is already dead from
+            # kill(); reap it explicitly so no zombie (or ResourceWarning)
+            # is left behind.
+            out, err = "", ""
+            try:
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001 - best effort reap only
+                pass
+        return 124, out or "", err or "", True
 
 
 def _run(cmd: list[str], cwd: str,
@@ -117,6 +148,36 @@ def changed_set(root: str) -> tuple[set[str], bool]:
     if code == 0:
         changed.update(p for p in out.splitlines() if p)
     return changed, True
+
+
+def check_files_nonempty(root: str, patterns: list[str]) -> list[dict]:
+    """Required artifacts must exist AND be non-empty."""
+    findings: list[dict] = []
+    for pattern in patterns:
+        matched = _glob_match(pattern, root)
+        nonempty = [p for p in matched if _is_nonempty(root, p)]
+        if nonempty:
+            findings.append({"check": "files_nonempty", "ok": True,
+                             "target": pattern,
+                             "evidence": f"non-empty: "
+                             f"{', '.join(nonempty[:5])}"})
+        elif matched:
+            findings.append({"check": "files_nonempty", "ok": False,
+                             "target": pattern,
+                             "evidence": "file exists but is empty — "
+                             "the agent may have created a placeholder"})
+        else:
+            findings.append({"check": "files_nonempty", "ok": False,
+                             "target": pattern,
+                             "evidence": "no such file"})
+    return findings
+
+
+def _is_nonempty(root: str, rel: str) -> bool:
+    try:
+        return os.path.getsize(os.path.join(root, rel)) > 0
+    except OSError:
+        return False
 
 
 def check_files_changed(root: str, patterns: list[str]) -> list[dict]:
@@ -208,6 +269,16 @@ def check_command(root: str, spec: dict, show_output: bool) -> dict:
             "timed_out": timed_out}
 
 
+def _check_string_list(data: dict, key: str) -> str:
+    value = data.get(key, [])
+    if not isinstance(value, list):
+        return f"'{key}' must be a list of paths/globs"
+    for i, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            return f"'{key}[{i}]' must be a non-empty string"
+    return ""
+
+
 def load_criteria(path: str) -> tuple[dict | None, str]:
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -222,9 +293,10 @@ def load_criteria(path: str) -> tuple[dict | None, str]:
     if unknown:
         return None, f"unknown top-level key(s): {sorted(unknown)} " \
                      f"(allowed: {sorted(TOP_LEVEL_KEYS)})"
-    for key in ("files_exist", "files_changed"):
-        if key in data and not isinstance(data[key], list):
-            return None, f"'{key}' must be a list of paths/globs"
+    for key in ("files_exist", "files_nonempty", "files_changed"):
+        problem = _check_string_list(data, key)
+        if problem:
+            return None, problem
     commands = data.get("commands", [])
     if not isinstance(commands, list):
         return None, "'commands' must be a list"
@@ -234,8 +306,35 @@ def load_criteria(path: str) -> tuple[dict | None, str]:
         unknown = set(spec) - COMMAND_KEYS
         if unknown:
             return None, f"commands[{i}] unknown key(s): {sorted(unknown)}"
-    if not data.get("files_exist") and not data.get("files_changed") \
-            and not commands:
+        run = spec.get("run", "")
+        if not isinstance(run, str) or not run.strip():
+            return None, f"commands[{i}].run must be a non-empty string"
+        if "expect_exit" in spec and (
+                not isinstance(spec["expect_exit"], int)
+                or isinstance(spec["expect_exit"], bool)):
+            return None, f"commands[{i}].expect_exit must be an integer"
+        if "timeout" in spec:
+            try:
+                if int(spec["timeout"]) < 1:
+                    raise ValueError
+            except (ValueError, TypeError):
+                return None, f"commands[{i}].timeout must be an integer >= 1"
+        for list_key in ("expect_output", "forbid_output"):
+            patterns = spec.get(list_key, [])
+            if not isinstance(patterns, list) or not all(
+                    isinstance(p, str) for p in patterns):
+                return None, f"commands[{i}].{list_key} must be a list " \
+                              "of regex strings"
+            for pattern in patterns:
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    return None, f"commands[{i}].{list_key} has an invalid " \
+                                 f"regex {pattern!r}: {exc}"
+        if "cwd" in spec and not isinstance(spec["cwd"], str):
+            return None, f"commands[{i}].cwd must be a string"
+    if not data.get("files_exist") and not data.get("files_nonempty") \
+            and not data.get("files_changed") and not commands:
         return None, "no checks declared (nothing to verify)"
     return data, ""
 
@@ -244,6 +343,8 @@ def run_all(root: str, criteria: dict, show_output: bool) -> list[dict]:
     findings: list[dict] = []
     for pattern in criteria.get("files_exist", []) or []:
         findings.extend(check_files_exist(root, [pattern]))
+    for pattern in criteria.get("files_nonempty", []) or []:
+        findings.extend(check_files_nonempty(root, [pattern]))
     for pattern in criteria.get("files_changed", []) or []:
         findings.extend(check_files_changed(root, [pattern]))
     for spec in criteria.get("commands", []) or []:
@@ -279,6 +380,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "(default: <root>/acceptance.json)")
     parser.add_argument("--expect-file", action="append", default=[],
                         help="require a file/glob to exist (repeatable)")
+    parser.add_argument("--expect-nonempty", action="append", default=[],
+                        help="require a file/glob to exist and be non-empty "
+                             "(repeatable)")
     parser.add_argument("--expect-change", action="append", default=[],
                         help="require a file/glob changed vs HEAD "
                              "(repeatable)")
@@ -311,7 +415,8 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
-    criteria: dict = {"files_exist": [], "files_changed": [], "commands": []}
+    criteria: dict = {"files_exist": [], "files_nonempty": [],
+                   "files_changed": [], "commands": []}
     crit_path = (os.path.abspath(args.criteria) if args.criteria
                  else os.path.join(root, "acceptance.json"))
     if args.criteria or os.path.isfile(crit_path):
@@ -322,6 +427,8 @@ def main(argv: list[str] | None = None) -> int:
         criteria = data
     for pattern in args.expect_file:
         criteria.setdefault("files_exist", []).append(pattern)
+    for pattern in args.expect_nonempty:
+        criteria.setdefault("files_nonempty", []).append(pattern)
     for pattern in args.expect_change:
         criteria.setdefault("files_changed", []).append(pattern)
     if args.run and (args.expect_output or args.forbid_output):
@@ -335,7 +442,8 @@ def main(argv: list[str] | None = None) -> int:
             "run": command, "timeout": args.timeout,
             "expect_exit": 0, "expect_output": args.expect_output,
             "forbid_output": args.forbid_output})
-    if not criteria.get("files_exist") and not criteria.get("files_changed") \
+    if not criteria.get("files_exist") and not criteria.get("files_nonempty") \
+            and not criteria.get("files_changed") \
             and not criteria.get("commands"):
         print("done-guard: error: no checks declared (pass flags or a "
               "criteria file)", file=sys.stderr)

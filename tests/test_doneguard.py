@@ -91,6 +91,31 @@ class CriteriaTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_wrong_typed_fields_rejected(self):
+        bad = [
+            {"files_exist": [123]},
+            {"files_exist": [""]},
+            {"files_changed": ["ok", None]},
+            {"commands": [{"run": "x", "expect_exit": "zero"}]},
+            {"commands": [{"run": "x", "expect_exit": True}]},
+            {"commands": [{"run": "x", "timeout": 0}]},
+            {"commands": [{"run": "x", "forbid_output": "(unclosed"}]},
+            {"commands": [{"run": "x", "expect_output": [7]}]},
+            {"commands": [{"run": "x", "cwd": 5}]},
+            {"commands": [{"run": "  "}]},
+        ]
+        for doc in bad:
+            with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                             delete=False) as tmp:
+                json.dump(doc, tmp)
+                path = tmp.name
+            try:
+                data, err = doneguard.load_criteria(path)
+                self.assertIsNone(data, doc)
+                self.assertTrue(err, doc)
+            finally:
+                os.unlink(path)
+
 
 class FilesTests(unittest.TestCase):
     def setUp(self):
@@ -104,6 +129,14 @@ class FilesTests(unittest.TestCase):
                                                            "dist/*.js",
                                                            "missing.txt"])
         self.assertEqual([f["ok"] for f in findings], [True, True, False])
+
+    def test_nonempty(self):
+        write(self.root, "full.txt", "data\n")
+        write(self.root, "empty.txt", "")
+        findings = doneguard.check_files_nonempty(
+            self.root, ["full.txt", "empty.txt", "missing.txt"])
+        self.assertEqual([f["ok"] for f in findings], [True, False, False])
+        self.assertIn("placeholder", findings[1]["evidence"])
 
     def test_changed_detects_modification(self):
         write(self.root, "a.txt", "v1\n")
@@ -174,6 +207,12 @@ class CommandTests(unittest.TestCase):
             wait, self.root, timeout=2)
         self.assertEqual(code, 124)
         self.assertTrue(timed_out)
+
+    def test_run_shell_spawn_failure_is_finding_not_crash(self):
+        code, out, err, timed_out = doneguard._run_shell(
+            "echo hi", os.path.join(self.root, "no-such-dir"), timeout=10)
+        self.assertEqual(code, 127)
+        self.assertFalse(timed_out)
 
     def test_forbid_output_catches_false_pass(self):
         # Exit 0 but output proves failure: must still FAIL.

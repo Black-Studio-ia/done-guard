@@ -13,6 +13,7 @@ You declare the finish line **before** (or after) the agent runs — `acceptance
 ```json
 {
   "files_exist": ["dist/app.js", "CHANGELOG.md"],
+  "files_nonempty": ["dist/app.js"],
   "files_changed": ["src/**/*.py"],
   "commands": [
     {"run": "python -m pytest -q", "timeout": 300, "expect_exit": 0,
@@ -57,7 +58,8 @@ Exit codes: `0` evidenced, `1` unmet, `2` misconfigured. `--format json` for pip
 ## Features
 
 - `files_exist` (globs supported), `files_changed` (new/untracked/modified vs HEAD; honest non-git fallback), `commands` (exit code, timeouts, output patterns)
-- Fail-closed config: unknown keys, malformed JSON, and empty criteria are usage errors (exit 2), never silent passes
+- Fail-closed config: unknown keys, wrong types, invalid regexes, malformed JSON, and empty criteria are usage errors (exit 2), never silent passes
+- Timeouts kill the command (whole process group on POSIX, so stray grandchildren die too) and fail the check; spawn failures are findings, not tracebacks
 - Output tails are bounded (last 20 lines, truncated); `--no-output` suppresses them entirely
 - Cross-platform command execution (Windows-safe); per-command timeouts with kills
 - Zero dependencies, offline, read-only (never modifies your tree)
@@ -91,9 +93,9 @@ See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — test suite plus a
 
 ```
 usage: done-guard [--root DIR] [--criteria FILE] [--expect-file P]
-                  [--expect-change P] [--run CMD] [--expect-output RE]
-                  [--forbid-output RE] [--timeout S] [--no-output]
-                  [--format text|json]
+                  [--expect-nonempty P] [--expect-change P] [--run CMD]
+                  [--expect-output RE] [--forbid-output RE] [--timeout S]
+                  [--no-output] [--format text|json]
 ```
 
 ## Security and privacy
