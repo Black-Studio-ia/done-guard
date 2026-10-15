@@ -182,6 +182,100 @@ class FilesTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_files_contain(self):
+        write(self.root, "report.md", "# Report\nTotal: 42\n")
+        write(self.root, "wrong.md", "# Report\nNothing here\n")
+        findings = doneguard.check_files_contain(
+            self.root, [{"file": "report.md", "patterns": ["Total: \\d+"]},
+                        {"file": "wrong.md", "patterns": ["Total:"]},
+                        {"file": "absent.md", "patterns": ["x"]}])
+        self.assertEqual([f["ok"] for f in findings], [True, False, False])
+        self.assertEqual(findings[0]["check"], "files_contain")
+
+    def test_files_contain_bad_spec_rejected(self):
+        bad_docs = [
+            {"files_contain": [{"file": "a"}]},
+            {"files_contain": [{"patterns": ["x"]}]},
+            {"files_contain": [{"file": "", "patterns": ["x"]}]},
+            {"files_contain": "nope"},
+            {"git_branch": 5},
+        ]
+        bad_regex_doc = {"files_contain": [{"file": "a",
+                                             "patterns": ['(unclosed']}]}
+        for doc in bad_docs + [bad_regex_doc]:
+            with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                             delete=False) as tmp:
+                json.dump(doc, tmp)
+                path = tmp.name
+            try:
+                data, err = doneguard.load_criteria(path)
+                self.assertIsNone(data, doc)
+                self.assertTrue(err, doc)
+            finally:
+                os.unlink(path)
+
+    def test_git_branch(self):
+        root = make_repo({"a.txt": "x\n"})
+        self.addCleanup(shutil.rmtree, root, True)
+        git(root, "add", "-A")
+        git(root, "commit", "-m", "b")
+        branch = git(root, "branch", "--show-current").strip()
+        self.assertTrue(
+            doneguard.check_git_branch(root, branch)[0]["ok"])
+        res = doneguard.check_git_branch(root, "definitely-not-this")[0]
+        self.assertFalse(res["ok"])
+        self.assertIn("wrong state", res["evidence"])
+
+    def test_added_forbid_ignores_removed_lines(self):
+        root = make_repo({"t.js": "it.only('old', () => {});\nkeep();\n"})
+        self.addCleanup(shutil.rmtree, root, True)
+        git(root, "add", "-A")
+        git(root, "commit", "-m", "b")
+        with open(os.path.join(root, "t.js"), "w", encoding="utf-8",
+                  newline="\n") as handle:
+            handle.write("keep();\n")  # .only line REMOVED, not added
+        findings = doneguard.check_added_forbid(root, [r"\.only\("])
+        self.assertTrue(all(f["ok"] for f in findings))
+
+    def test_added_forbid_renamed_file(self):
+        root = make_repo({"old.js": "a();\n"})
+        self.addCleanup(shutil.rmtree, root, True)
+        git(root, "add", "-A")
+        git(root, "commit", "-m", "b")
+        os.rename(os.path.join(root, "old.js"), os.path.join(root, "new.js"))
+        with open(os.path.join(root, "new.js"), "a", encoding="utf-8",
+                  newline="\n") as handle:
+            handle.write("it.only('x', () => {});\n")
+        git(root, "add", "-A")
+        findings = doneguard.check_added_forbid(root, [r"\.only\("])
+        self.assertTrue(any(not f["ok"] for f in findings))
+
+    def test_added_forbid_unicode_path(self):
+        name = "täst-ü.js"
+        root = make_repo({name: "a();\n"})
+        self.addCleanup(shutil.rmtree, root, True)
+        git(root, "add", "-A")
+        git(root, "commit", "-m", "b")
+        with open(os.path.join(root, name), "a", encoding="utf-8",
+                  newline="\n") as handle:
+            handle.write("fit('x', () => {});\n")
+        findings = doneguard.check_added_forbid(root, [r"\bfit\s*\("])
+        self.assertTrue(any(not f["ok"] and name in f["evidence"]
+                            for f in findings),
+                        json.dumps(findings))
+
+    def test_added_forbid_skips_binary_diff(self):
+        root = make_repo({})
+        self.addCleanup(shutil.rmtree, root, True)
+        with open(os.path.join(root, "blob.bin"), "wb") as handle:
+            handle.write(b"\x00\x01\x02" * 100)
+        git(root, "add", "-A")
+        git(root, "commit", "-m", "b")
+        with open(os.path.join(root, "blob.bin"), "ab") as handle:
+            handle.write(b"\x03\x04")
+        findings = doneguard.check_added_forbid(root, [r"."])
+        self.assertTrue(all(f["ok"] for f in findings))
+
     def test_changed_detects_modification(self):
         write(self.root, "a.txt", "v1\n")
         write(self.root, "b.txt", "v1\n")
@@ -257,6 +351,18 @@ class CommandTests(unittest.TestCase):
             "echo hi", os.path.join(self.root, "no-such-dir"), timeout=10)
         self.assertEqual(code, 127)
         self.assertFalse(timed_out)
+
+    @unittest.skipIf(os.name == "nt" or shutil.which("pgrep") is None,
+                     "needs POSIX pgrep")
+    def test_timeout_leaves_no_orphan(self):
+        marker = "done-guard-orphan-probe-xyz"
+        res = doneguard.check_command(
+            self.root, {"run": f"sleep 60 # {marker}", "timeout": 2}, True)
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["timed_out"])
+        left = subprocess.run(["pgrep", "-f", marker], capture_output=True,
+                              text=True).stdout.strip()
+        self.assertEqual(left, "", f"orphan survived: {left}")
 
     def test_forbid_output_catches_false_pass(self):
         # Exit 0 but output proves failure: must still FAIL.
@@ -334,6 +440,14 @@ class CliTests(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertTrue(payload["ok"])
         self.assertEqual(len(payload["findings"]), 1)
+
+    def test_cli_usage_error_stays_text_on_stderr(self):
+        # Contract: usage/config errors are text on stderr + exit 2,
+        # even under --format json (only verdicts are JSON).
+        proc = self.run_cli("--root", self.root, "--format", "json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("no checks declared", proc.stderr)
 
     def test_criteria_file_end_to_end(self):
         crit = {"files_changed": ["app.py"],

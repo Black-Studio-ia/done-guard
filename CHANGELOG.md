@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 — 2026-10-15
+
+- New check kinds: `files_contain` (required content patterns — closes the
+  "right file, wrong content" false acceptance) and `git_branch` (fails
+  when HEAD is not on the expected branch — closes "verified the wrong
+  state").
+- `git -c core.quotepath=false` on all plumbing calls so non-ASCII paths
+  cannot mismatch between diff output and the worktree.
+- Documented output contract: verdicts are JSON under `--format json`;
+  usage/config errors stay text on stderr with exit 2.
+- Manual agent Stop-hook wiring documented; managed hook installation
+  deferred to donegate (verified better fit — see README).
+
 ## 0.3.0 — 2026-10-15
 
 - New check kind `added_forbid`: user regexes that must not appear in

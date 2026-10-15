@@ -60,7 +60,7 @@ Exit codes: `0` evidenced, `1` unmet, `2` misconfigured. `--format json` for pip
 
 ## Features
 
-- `files_exist` (globs supported), `files_changed` (new/untracked/modified vs HEAD; honest non-git fallback), `commands` (exit code, timeouts, output patterns)
+- `files_exist` (globs supported), `files_nonempty`, `files_changed` (new/untracked/modified vs HEAD; honest non-git fallback), `files_contain` (required content patterns), `added_forbid` (user regexes banned from added lines: catches narrowed tests), `git_branch` (verifies the checked-out state), `commands` (exit code, timeouts, output patterns)
 - Fail-closed config: unknown keys, wrong types, invalid regexes, malformed JSON, and empty criteria are usage errors (exit 2), never silent passes
 - Timeouts kill the command (whole process group on POSIX, so stray grandchildren die too) and fail the check; spawn failures are findings, not tracebacks
 - Output tails are bounded (last 20 lines, truncated); `--no-output` suppresses them entirely
@@ -88,6 +88,22 @@ Verify: `python doneguard.py --version`
 
 This repo dogfoods it: [`acceptance.json`](acceptance.json) requires the test suite green with no failures.
 
+### Agent Stop hooks (manual wiring)
+
+done-guard ships no installer, but any agent hook that runs a command can
+call it — the same pattern hook-based gates use. Example shape for a
+Claude Code Stop hook (`.claude/settings.json`; adjust paths to your
+checkout — verify the working directory your agent uses for hooks):
+
+```json
+{"hooks": {"Stop": [{"hooks": [{"type": "command",
+  "command": "python /path/to/doneguard.py --root /path/to/checkout"}]}]}}
+```
+
+A red verdict's text goes back to the agent as the next prompt. For
+managed hook installation, bounce-back loops, and tamper receipts,
+donegate covers that workflow better — see the comparison above.
+
 ### GitHub Actions
 
 See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — test suite plus a done-guard self-gate on every push.
@@ -97,7 +113,8 @@ See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — test suite plus a
 ```
 usage: done-guard [--root DIR] [--criteria FILE] [--expect-file P]
                   [--expect-nonempty P] [--expect-change P]
-                  [--forbid-added RE] [--run CMD] [--expect-output RE]
+                  [--forbid-added RE] [--expect-contains FILE:REGEX]
+                  [--expect-branch BRANCH] [--run CMD] [--expect-output RE]
                   [--forbid-output RE] [--timeout S] [--no-output]
                   [--format text|json]
 ```
@@ -121,7 +138,7 @@ usage: done-guard [--root DIR] [--criteria FILE] [--expect-file P]
 python -m unittest discover -s tests -v
 ```
 
-21 tests, stdlib only: criteria validation, file/change checks (real git fixtures), command pass/fail/timeout/missing-binary, output-pattern gates (including exit-0-with-FAILED adversarial case), CLI exit codes, JSON validity, end-to-end criteria file.
+ 38 tests, stdlib only: criteria validation (incl. wrong types and bad regexes), file/change/nonempty/content/branch checks (real git fixtures), added_forbid (narrowed tests, renames, removed-lines exclusion, unicode paths, binary diffs, no-baseline skip), command pass/fail/timeout/missing-binary/spawn-failure, output-pattern gates (including exit-0-with-FAILED adversarial case), orphan-process handling, CLI exit codes, JSON validity incl. the text-on-stderr usage-error contract, end-to-end criteria file.
 
 ## License
 

@@ -24,14 +24,17 @@ import signal
 import subprocess
 import sys
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 DEFAULT_TIMEOUT = 300
 OUTPUT_TAIL_LINES = 20
 OUTPUT_LINE_LIMIT = 500
 
 TOP_LEVEL_KEYS = {"files_exist", "files_nonempty", "files_changed",
-                  "added_forbid", "commands"}
+                  "files_contain", "added_forbid", "git_branch",
+                  "commands"}
+COMMAND_KEYS = {"run", "timeout", "expect_exit", "expect_output",
+                "forbid_output", "cwd"}
 COMMAND_KEYS = {"run", "timeout", "expect_exit", "expect_output",
                 "forbid_output", "cwd"}
 
@@ -96,9 +99,12 @@ def _run(cmd: list[str], cwd: str,
 
 
 def _git(root: str, args: list[str]) -> tuple[int, str]:
+    # quotepath=false keeps non-ASCII paths literal so parsers comparing
+    # diff output against worktree paths cannot mismatch on quoting.
     try:
-        proc = subprocess.run(["git", *args], cwd=root, capture_output=True,
-                              text=True, errors="replace", timeout=60)
+        proc = subprocess.run(
+            ["git", "-c", "core.quotepath=false", *args], cwd=root,
+            capture_output=True, text=True, errors="replace", timeout=60)
         return proc.returncode, proc.stdout
     except (OSError, subprocess.SubprocessError):
         return 127, ""
@@ -178,6 +184,58 @@ def _is_nonempty(root: str, rel: str) -> bool:
         return os.path.getsize(os.path.join(root, rel)) > 0
     except OSError:
         return False
+
+
+def check_files_contain(root: str, specs: list[dict]) -> list[dict]:
+    """Required content must appear in the named files.
+
+    Catches the "right file, wrong content" false acceptance: existence
+    alone cannot prove the artifact is correct.
+    """
+    findings: list[dict] = []
+    for spec in specs:
+        path = spec.get("file", "")
+        patterns = spec.get("patterns", [])
+        full = os.path.join(root, path)
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            findings.append({"check": "files_contain", "ok": False,
+                             "target": path or "(missing file)",
+                             "evidence": "file unreadable or absent"})
+            continue
+        missing = [p for p in patterns if not re.search(p, text)]
+        if not missing:
+            findings.append({"check": "files_contain", "ok": True,
+                             "target": path,
+                             "evidence": "all required patterns present"})
+        else:
+            findings.append({"check": "files_contain", "ok": False,
+                             "target": path,
+                             "evidence": "content missing required "
+                             f"pattern(s): {missing}"})
+    return findings
+
+
+def check_git_branch(root: str, expected: str) -> list[dict]:
+    """Fail when HEAD is not on the expected branch.
+
+    Guards the "verified the wrong state" false acceptance: same files,
+    stale branch, green-but-irrelevant checks.
+    """
+    code, out = _git(root, ["rev-parse", "--abbrev-ref", "HEAD"])
+    if code != 0:
+        return [{"check": "git_branch", "ok": False, "target": expected,
+                 "evidence": "not a git repository (or no HEAD) — cannot "
+                 "confirm the checked-out state"}]
+    actual = out.strip()
+    if actual == expected:
+        return [{"check": "git_branch", "ok": True, "target": expected,
+                 "evidence": f"on branch {actual}"}]
+    return [{"check": "git_branch", "ok": False, "target": expected,
+             "evidence": f"on {actual!r}, expected {expected!r} — results "
+             "may describe the wrong state"}]
 
 
 def _added_lines(root: str) -> tuple[list[tuple[str, int]], bool]:
@@ -386,6 +444,31 @@ def load_criteria(path: str) -> tuple[dict | None, str]:
         except re.error as exc:
             return None, f"added_forbid has an invalid regex " \
                          f"{pattern!r}: {exc}"
+    files_contain = data.get("files_contain", [])
+    if not isinstance(files_contain, list):
+        return None, "'files_contain' must be a list of " \
+                     "{file, patterns} objects"
+    for i, spec in enumerate(files_contain):
+        if not isinstance(spec, dict):
+            return None, f"files_contain[{i}] must be an object"
+        if not isinstance(spec.get("file", ""), str) \
+                or not spec.get("file", "").strip():
+            return None, f"files_contain[{i}].file must be a non-empty " \
+                         "string"
+        patterns = spec.get("patterns", [])
+        if not isinstance(patterns, list) or not patterns or not all(
+                isinstance(p, str) and p for p in patterns):
+            return None, f"files_contain[{i}].patterns must be a non-empty " \
+                         "list of regex strings"
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                return None, f"files_contain[{i}] has an invalid regex " \
+                             f"{pattern!r}: {exc}"
+    git_branch = data.get("git_branch", "")
+    if git_branch is not None and not isinstance(git_branch, str):
+        return None, "'git_branch' must be a string"
     commands = data.get("commands", [])
     if not isinstance(commands, list):
         return None, "'commands' must be a list"
@@ -424,7 +507,9 @@ def load_criteria(path: str) -> tuple[dict | None, str]:
             return None, f"commands[{i}].cwd must be a string"
     if not data.get("files_exist") and not data.get("files_nonempty") \
             and not data.get("files_changed") \
-            and not data.get("added_forbid") and not commands:
+            and not data.get("added_forbid") \
+            and not data.get("files_contain") \
+            and not data.get("git_branch") and not commands:
         return None, "no checks declared (nothing to verify)"
     return data, ""
 
@@ -440,6 +525,10 @@ def run_all(root: str, criteria: dict, show_output: bool) -> list[dict]:
     added_forbid = criteria.get("added_forbid", []) or []
     if added_forbid:
         findings.extend(check_added_forbid(root, added_forbid))
+    for spec in criteria.get("files_contain", []) or []:
+        findings.extend(check_files_contain(root, [spec]))
+    if criteria.get("git_branch"):
+        findings.extend(check_git_branch(root, criteria["git_branch"]))
     for spec in criteria.get("commands", []) or []:
         findings.append(check_command(root, spec, show_output))
     return findings
@@ -482,6 +571,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--forbid-added", action="append", default=[],
                         help="regex that must not appear in added lines, "
                              "e.g. focused-test markers (repeatable)")
+    parser.add_argument("--expect-contains", action="append", default=[],
+                        metavar="FILE:REGEX",
+                        help="require REGEX in FILE, e.g. "
+                             "--expect-contains report.md:Total (repeatable)")
+    parser.add_argument("--expect-branch", default="",
+                        help="require HEAD on this git branch")
     parser.add_argument("--run", action="append", default=[],
                         help="command that must exit 0 (repeatable)")
     parser.add_argument("--expect-output", action="append", default=[],
@@ -512,7 +607,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     criteria: dict = {"files_exist": [], "files_nonempty": [],
-                   "files_changed": [], "added_forbid": [], "commands": []}
+                   "files_changed": [], "added_forbid": [],
+                   "files_contain": [], "git_branch": "", "commands": []}
     crit_path = (os.path.abspath(args.criteria) if args.criteria
                  else os.path.join(root, "acceptance.json"))
     if args.criteria or os.path.isfile(crit_path):
@@ -533,6 +629,22 @@ def main(argv: list[str] | None = None) -> int:
                   f"{pattern!r}: {exc}", file=sys.stderr)
             return 2
         criteria.setdefault("added_forbid", []).append(pattern)
+    for item in args.expect_contains:
+        path, sep, regex = item.partition(":")
+        if not sep or not path.strip() or not regex:
+            print("done-guard: error: --expect-contains needs "
+                  "FILE:REGEX", file=sys.stderr)
+            return 2
+        try:
+            re.compile(regex)
+        except re.error as exc:
+            print(f"done-guard: error: invalid --expect-contains regex "
+                  f"{regex!r}: {exc}", file=sys.stderr)
+            return 2
+        criteria.setdefault("files_contain", []).append(
+            {"file": path.strip(), "patterns": [regex]})
+    if args.expect_branch:
+        criteria["git_branch"] = args.expect_branch
     for pattern in args.expect_change:
         criteria.setdefault("files_changed", []).append(pattern)
     if args.run and (args.expect_output or args.forbid_output):
@@ -549,6 +661,8 @@ def main(argv: list[str] | None = None) -> int:
     if not criteria.get("files_exist") and not criteria.get("files_nonempty") \
             and not criteria.get("files_changed") \
             and not criteria.get("added_forbid") \
+            and not criteria.get("files_contain") \
+            and not criteria.get("git_branch") \
             and not criteria.get("commands"):
         print("done-guard: error: no checks declared (pass flags or a "
               "criteria file)", file=sys.stderr)
