@@ -165,6 +165,16 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(res["timed_out"])
         self.assertIn("timed out", res["evidence"])
 
+    def test_run_shell_never_raises_on_timeout(self):
+        # Regression: the POSIX shell branch once let TimeoutExpired
+        # propagate, crashing the whole gate instead of failing one check.
+        wait = ("sleep 20" if os.name != "nt"
+                else "powershell -command Start-Sleep -Seconds 20")
+        code, out, err, timed_out = doneguard._run_shell(
+            wait, self.root, timeout=2)
+        self.assertEqual(code, 124)
+        self.assertTrue(timed_out)
+
     def test_forbid_output_catches_false_pass(self):
         # Exit 0 but output proves failure: must still FAIL.
         cmd = ("printf 'ok\\nFAILED 3 tests\\n'" if os.name != "nt"

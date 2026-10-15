@@ -34,7 +34,22 @@ COMMAND_KEYS = {"run", "timeout", "expect_exit", "expect_output",
                 "forbid_output", "cwd"}
 
 
-def _run(cmd: list[str], cwd: str, timeout: int):
+def _run_shell(cmd: str, cwd: str,
+               timeout: int) -> tuple[int, str, str, bool]:
+    """Run a shell string with a timeout. Never raises on timeout."""
+    try:
+        proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True,
+                              text=True, errors="replace", timeout=timeout)
+        return proc.returncode, proc.stdout or "", proc.stderr or "", False
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout if isinstance(exc.stdout, str) else ""
+        err = exc.stderr if isinstance(exc.stderr, str) else ""
+        return 124, out, err, True
+
+
+def _run(cmd: list[str], cwd: str,
+         timeout: int) -> tuple[int, str, str, bool]:
+    """Run an argv list with a timeout. Never raises on timeout."""
     try:
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                               errors="replace", timeout=timeout)
@@ -167,11 +182,7 @@ def check_command(root: str, spec: dict, show_output: bool) -> dict:
         shell = True
     try:
         if shell:
-            proc = subprocess.run(cmd, shell=True, cwd=cwd,
-                                  capture_output=True, text=True,
-                                  errors="replace", timeout=timeout)
-            code, out, err, timed_out = (proc.returncode, proc.stdout,
-                                         proc.stderr, False)
+            code, out, err, timed_out = _run_shell(cmd, cwd, timeout)
         else:
             code, out, err, timed_out = _run(cmd, cwd, timeout)
     except OSError as exc:
