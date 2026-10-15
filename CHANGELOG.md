@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 — 2026-10-15
+
+- Fixed locale-dependent decoding: all subprocess and git output is now
+  decoded as explicit UTF-8 instead of the platform locale. Previously,
+  non-ASCII paths were mangled on Windows runners using cp1252, which
+  broke unicode-path matching (CI caught it on all Windows jobs; local
+  UTF-8-locale runs passed).
+
 ## 0.4.0 — 2026-10-15
 
 - New check kinds: `files_contain` (required content patterns — closes the

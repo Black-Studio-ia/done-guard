@@ -24,7 +24,7 @@ import signal
 import subprocess
 import sys
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 DEFAULT_TIMEOUT = 300
 OUTPUT_TAIL_LINES = 20
@@ -39,6 +39,14 @@ COMMAND_KEYS = {"run", "timeout", "expect_exit", "expect_output",
                 "forbid_output", "cwd"}
 
 
+def _decode(data: bytes | str | None) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    return data.decode("utf-8", "replace")
+
+
 def _run_shell(cmd: str, cwd: str,
                timeout: int) -> tuple[int, str, str, bool]:
     """Run a shell string with a timeout. Never raises for timeouts or
@@ -47,13 +55,12 @@ def _run_shell(cmd: str, cwd: str,
     try:
         proc = subprocess.Popen(
             cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, errors="replace",
-            **new_session)  # type: ignore[arg-type]
+            stderr=subprocess.PIPE, **new_session)  # type: ignore[arg-type]
     except OSError as exc:
         return 127, "", f"could not start command: {exc}", False
     try:
         out, err = proc.communicate(timeout=timeout)
-        return proc.returncode, out or "", err or "", False
+        return proc.returncode, _decode(out), _decode(err), False
     except subprocess.TimeoutExpired:
         # Kill the whole process group on POSIX so grandchildren (a runaway
         # `sleep`, a hung child server, …) die with the shell, not after it.
@@ -78,22 +85,19 @@ def _run_shell(cmd: str, cwd: str,
                 proc.wait(timeout=5)
             except Exception:  # noqa: BLE001 - best effort reap only
                 pass
-        return 124, out or "", err or "", True
+        return 124, _decode(out), _decode(err), True
 
 
 def _run(cmd: list[str], cwd: str,
          timeout: int) -> tuple[int, str, str, bool]:
     """Run an argv list with a timeout. Never raises on timeout."""
     try:
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                              errors="replace", timeout=timeout)
-        return proc.returncode, proc.stdout, proc.stderr, False
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=timeout)
+        return proc.returncode, _decode(proc.stdout), _decode(proc.stderr), False
     except FileNotFoundError:
         return 127, "", f"command not found: {cmd[0]}", False
     except subprocess.TimeoutExpired as exc:
-        out = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-        err = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
-        return 124, out, err, True
+        return 124, _decode(exc.stdout), _decode(exc.stderr), True
     except OSError as exc:
         return 127, "", str(exc), False
 
@@ -101,11 +105,13 @@ def _run(cmd: list[str], cwd: str,
 def _git(root: str, args: list[str]) -> tuple[int, str]:
     # quotepath=false keeps non-ASCII paths literal so parsers comparing
     # diff output against worktree paths cannot mismatch on quoting.
+    # Decode as UTF-8 explicitly: text mode would use the locale encoding
+    # (e.g. cp1252 on some Windows runners) and mangle non-ASCII paths.
     try:
         proc = subprocess.run(
             ["git", "-c", "core.quotepath=false", *args], cwd=root,
-            capture_output=True, text=True, errors="replace", timeout=60)
-        return proc.returncode, proc.stdout
+            capture_output=True, timeout=60)
+        return proc.returncode, proc.stdout.decode("utf-8", "replace")
     except (OSError, subprocess.SubprocessError):
         return 127, ""
 
